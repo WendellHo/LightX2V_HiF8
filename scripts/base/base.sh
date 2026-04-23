@@ -1,16 +1,16 @@
 #!/bin/bash
 
-if [ -z "${lightx2v_path}" ]; then
+if [ -z "${lightx2v_path:-}" ]; then
     echo "Error: lightx2v_path is not set. Please set this variable first."
     exit 1
 fi
 
-if [ -z "${model_path}" ]; then
+if [ -z "${model_path:-}" ]; then
     echo "Error: model_path is not set. Please set this variable first."
     exit 1
 fi
 
-export PYTHONPATH=${lightx2v_path}:$PYTHONPATH
+export PYTHONPATH="${lightx2v_path}:${PYTHONPATH:-}"
 
 # always set false to avoid some warnings
 export TOKENIZERS_PARALLELISM=false

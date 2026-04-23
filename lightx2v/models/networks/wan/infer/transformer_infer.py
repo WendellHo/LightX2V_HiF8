@@ -91,6 +91,55 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.has_post_adapter:
             self.reset_post_adapter_states()
 
+    def _get_progress(self):
+        infer_steps = getattr(self.scheduler, "infer_steps", 0)
+        step_index = getattr(self.scheduler, "step_index", 0)
+        if infer_steps is None or infer_steps <= 1:
+            return 0.0
+        return float(step_index) / float(max(infer_steps - 1, 1))
+
+    def _get_htg_group_idx(self, boundaries):
+        if boundaries is None:
+            return 0
+        if boundaries.numel() == 0:
+            return 0
+        progress = self._get_progress()
+        idx = 0
+        for b in boundaries.flatten():
+            if progress > float(b.item()):
+                idx += 1
+            else:
+                break
+        return idx
+
+    def _select_group_tensor(self, tensor, group_idx):
+        if tensor is None:
+            return None
+        if tensor.dim() == 1:
+            return tensor
+        if tensor.shape[0] == 0:
+            return None
+        group_idx = max(0, min(group_idx, tensor.shape[0] - 1))
+        return tensor[group_idx]
+
+    def _mm_apply_with_group_bias(self, mm_module, input_tensor, grouped_bias_tensor, group_idx):
+        if grouped_bias_tensor is None:
+            return mm_module.apply(input_tensor)
+
+        grouped_bias = self._select_group_tensor(grouped_bias_tensor, group_idx)
+        if grouped_bias is None:
+            return mm_module.apply(input_tensor)
+
+        original_bias = getattr(mm_module, "bias", None)
+        try:
+            mm_module.bias = grouped_bias
+            return mm_module.apply(input_tensor)
+        finally:
+            if original_bias is not None:
+                mm_module.bias = original_bias
+            else:
+                mm_module.bias = None
+
     @torch.no_grad()
     def infer(self, weights, pre_infer_out):
         self.cos_sin = pre_infer_out.cos_sin
@@ -179,9 +228,30 @@ class WanTransformerInfer(BaseTransformerInfer):
 
     def infer_self_attn(self, phase, x, shift_msa, scale_msa):
         cos_sin = self.cos_sin
-        if hasattr(phase, "smooth_norm1_weight"):
+        use_htg_norm1 = (
+            hasattr(phase, "htg_norm1_weight")
+            and hasattr(phase, "htg_norm1_bias")
+            and phase.htg_norm1_weight.tensor is not None
+            and phase.htg_norm1_bias.tensor is not None
+        )
+        if use_htg_norm1:
+            boundaries = (
+                phase.htg_norm1_boundaries.tensor
+                if hasattr(phase, "htg_norm1_boundaries")
+                else None
+            )
+            group_idx = self._get_htg_group_idx(boundaries)
+            htg_weight = self._select_group_tensor(phase.htg_norm1_weight.tensor, group_idx)
+            htg_bias = self._select_group_tensor(phase.htg_norm1_bias.tensor, group_idx)
+            norm1_weight = (1 + scale_msa.squeeze()) * htg_weight
+            norm1_bias = (shift_msa.squeeze() - 1.0) * htg_weight + htg_bias
+            norm1_out = phase.norm1.apply(x)
+            if self.sensitive_layer_dtype != self.infer_dtype:
+                norm1_out = norm1_out.to(self.sensitive_layer_dtype)
+            norm1_out.mul_(norm1_weight).add_(norm1_bias)
+        elif hasattr(phase, "smooth_norm1_weight"):
             norm1_weight = (1 + scale_msa.squeeze()) * phase.smooth_norm1_weight.tensor
-            norm1_bias = shift_msa.squeeze() * phase.smooth_norm1_bias.tensor
+            norm1_bias = (shift_msa.squeeze() - 1.0) * phase.smooth_norm1_weight.tensor + phase.smooth_norm1_bias.tensor
             norm1_out = phase.norm1.apply(x)
             if self.sensitive_layer_dtype != self.infer_dtype:
                 norm1_out = norm1_out.to(self.sensitive_layer_dtype)
@@ -196,9 +266,39 @@ class WanTransformerInfer(BaseTransformerInfer):
             norm1_out = norm1_out.to(self.infer_dtype)
 
         s, n, d = *norm1_out.shape[:1], self.num_heads, self.head_dim
-        q = phase.self_attn_norm_q.apply(phase.self_attn_q.apply(norm1_out)).view(s, n, d)
-        k = phase.self_attn_norm_k.apply(phase.self_attn_k.apply(norm1_out)).view(s, n, d)
-        v = phase.self_attn_v.apply(norm1_out).view(s, n, d)
+        q_group_bias = None
+        k_group_bias = None
+        v_group_bias = None
+        if use_htg_norm1:
+            if hasattr(phase, "self_attn_q_htg_group_bias"):
+                q_group_bias = phase.self_attn_q_htg_group_bias.tensor
+            if hasattr(phase, "self_attn_k_htg_group_bias"):
+                k_group_bias = phase.self_attn_k_htg_group_bias.tensor
+            if hasattr(phase, "self_attn_v_htg_group_bias"):
+                v_group_bias = phase.self_attn_v_htg_group_bias.tensor
+
+        q_proj = self._mm_apply_with_group_bias(
+            phase.self_attn_q,
+            norm1_out,
+            q_group_bias,
+            group_idx if use_htg_norm1 else 0,
+        )
+        k_proj = self._mm_apply_with_group_bias(
+            phase.self_attn_k,
+            norm1_out,
+            k_group_bias,
+            group_idx if use_htg_norm1 else 0,
+        )
+        v_proj = self._mm_apply_with_group_bias(
+            phase.self_attn_v,
+            norm1_out,
+            v_group_bias,
+            group_idx if use_htg_norm1 else 0,
+        )
+
+        q = phase.self_attn_norm_q.apply(q_proj).view(s, n, d)
+        k = phase.self_attn_norm_k.apply(k_proj).view(s, n, d)
+        v = v_proj.view(s, n, d)
         q, k = self.apply_rope_func(q, k, cos_sin)
         img_qkv_len = q.shape[0]
         if self.self_attn_cu_seqlens_qkv is None:
@@ -334,9 +434,30 @@ class WanTransformerInfer(BaseTransformerInfer):
             del attn_out
             torch_device_module.empty_cache()
 
-        if hasattr(phase, "smooth_norm2_weight"):
+        use_htg_norm2 = (
+            hasattr(phase, "htg_norm2_weight")
+            and hasattr(phase, "htg_norm2_bias")
+            and phase.htg_norm2_weight.tensor is not None
+            and phase.htg_norm2_bias.tensor is not None
+        )
+        if use_htg_norm2:
+            boundaries = (
+                phase.htg_norm2_boundaries.tensor
+                if hasattr(phase, "htg_norm2_boundaries")
+                else None
+            )
+            group_idx = self._get_htg_group_idx(boundaries)
+            htg_weight = self._select_group_tensor(phase.htg_norm2_weight.tensor, group_idx)
+            htg_bias = self._select_group_tensor(phase.htg_norm2_bias.tensor, group_idx)
+            norm2_weight = (1 + c_scale_msa.squeeze()) * htg_weight
+            norm2_bias = (c_shift_msa.squeeze() - 1.0) * htg_weight + htg_bias
+            norm2_out = phase.norm2.apply(x)
+            if self.sensitive_layer_dtype != self.infer_dtype:
+                norm2_out = norm2_out.to(self.sensitive_layer_dtype)
+            norm2_out.mul_(norm2_weight).add_(norm2_bias)
+        elif hasattr(phase, "smooth_norm2_weight"):
             norm2_weight = (1 + c_scale_msa.squeeze()) * phase.smooth_norm2_weight.tensor
-            norm2_bias = c_shift_msa.squeeze() * phase.smooth_norm2_bias.tensor
+            norm2_bias = (c_shift_msa.squeeze() - 1.0) * phase.smooth_norm2_weight.tensor + phase.smooth_norm2_bias.tensor
             norm2_out = phase.norm2.apply(x)
             if self.sensitive_layer_dtype != self.infer_dtype:
                 norm2_out = norm2_out.to(self.sensitive_layer_dtype)
@@ -350,7 +471,15 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.sensitive_layer_dtype != self.infer_dtype:
             norm2_out = norm2_out.to(self.infer_dtype)
 
-        y = phase.ffn_0.apply(norm2_out)
+        ffn0_group_bias = None
+        if use_htg_norm2 and hasattr(phase, "ffn_0_htg_group_bias"):
+            ffn0_group_bias = phase.ffn_0_htg_group_bias.tensor
+        y = self._mm_apply_with_group_bias(
+            phase.ffn_0,
+            norm2_out,
+            ffn0_group_bias,
+            group_idx if use_htg_norm2 else 0,
+        )
         if self.clean_cuda_cache:
             del norm2_out, x
             torch_device_module.empty_cache()

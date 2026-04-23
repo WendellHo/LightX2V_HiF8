@@ -273,6 +273,17 @@ class WanSelfAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "self_attn_q_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.q.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
 
         self.add_module(
             "self_attn_k",
@@ -287,6 +298,17 @@ class WanSelfAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "self_attn_k_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.k.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "self_attn_v",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -300,6 +322,17 @@ class WanSelfAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "self_attn_v_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.v.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "self_attn_o",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -436,6 +469,36 @@ class WanSelfAttention(WeightModule):
                 "smooth_norm1_weight",
                 TENSOR_REGISTER["Default"](
                     f"{block_prefix}.{self.block_index}.affine_norm1.weight",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "htg_norm1_weight",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.affine_norm1.htg_norm_weight",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "htg_norm1_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.affine_norm1.htg_norm_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "htg_norm1_boundaries",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.affine_norm1.htg_group_boundaries",
                     create_cuda_buffer,
                     create_cpu_buffer,
                     self.lazy_load,
@@ -655,6 +718,17 @@ class WanFFN(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "ffn_0_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.ffn.0.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "ffn_2",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -674,6 +748,36 @@ class WanFFN(WeightModule):
                 "smooth_norm2_weight",
                 TENSOR_REGISTER["Default"](
                     f"{block_prefix}.{self.block_index}.affine_norm3.weight",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "htg_norm2_weight",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.affine_norm3.htg_norm_weight",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "htg_norm2_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.affine_norm3.htg_norm_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "htg_norm2_boundaries",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.affine_norm3.htg_group_boundaries",
                     create_cuda_buffer,
                     create_cpu_buffer,
                     self.lazy_load,

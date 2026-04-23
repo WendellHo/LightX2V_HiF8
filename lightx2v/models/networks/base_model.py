@@ -116,6 +116,9 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             "gguf-Q3_K_M",
             "int8-npu",
             "fp8-intel-xpu",
+            "hif8-cuda",
+            "hif8-fused",
+            "hif8-fused-kernel",
         ]
 
     @abstractmethod

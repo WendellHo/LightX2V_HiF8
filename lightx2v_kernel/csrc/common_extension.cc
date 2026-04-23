@@ -46,6 +46,11 @@ TORCH_LIBRARY_FRAGMENT(lightx2v_kernel, m) {
       "alpha, Tensor? bias) -> ()");
   m.impl("cutlass_scaled_mxfp8_mm_sm120", torch::kCUDA, &cutlass_scaled_mxfp8_mm_sm120);
 
+  m.def(
+      "hif8_fused_mm_sm86(Tensor! out, Tensor input, Tensor weight_u8, Tensor? bias, bool "
+      "enable_input_qdq, bool enable_output_requant, str compute_dtype) -> ()");
+  m.impl("hif8_fused_mm_sm86", torch::kCUDA, &hif8_fused_mm_sm86);
+
 }
 
 REGISTER_EXTENSION(common_ops)

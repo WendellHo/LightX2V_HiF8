@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -90,3 +91,12 @@ void cutlass_scaled_mxfp8_mm_sm120(
     torch::Tensor const& B_sf,
     torch::Tensor const& alpha,
     c10::optional<torch::Tensor> const& bias);
+
+void hif8_fused_mm_sm86(
+    torch::Tensor& out,
+    torch::Tensor const& input,
+    torch::Tensor const& weight_u8,
+    c10::optional<torch::Tensor> const& bias,
+    bool enable_input_qdq,
+    bool enable_output_requant,
+    std::string const& compute_dtype);

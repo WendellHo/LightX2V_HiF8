@@ -29,6 +29,7 @@ try:
         cutlass_scaled_mxfp6_mxfp8_mm,
         cutlass_scaled_mxfp8_mm,
         cutlass_scaled_nvfp4_mm,
+        hif8_fused_mm,
         scaled_mxfp4_quant,
         scaled_mxfp6_quant,
         scaled_mxfp8_quant,
@@ -39,6 +40,7 @@ except ImportError:
     scaled_mxfp4_quant, cutlass_scaled_mxfp4_mm = None, None
     scaled_mxfp6_quant, cutlass_scaled_mxfp6_mxfp8_mm = None, None
     scaled_mxfp8_quant, cutlass_scaled_mxfp8_mm = None, None
+    hif8_fused_mm = None
 
 try:
     from vllm import _custom_ops as vllm_ops
@@ -716,6 +718,310 @@ class MMWeightWint8channelAint8channeldynamicVllm(MMWeightQuantTemplate):
         if self.has_lora_branch:
             return output_tensor + self.apply_lora(input_tensor)
         return output_tensor
+
+
+@MM_WEIGHT_REGISTER("hif8-cuda")
+class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
+    """
+    Native-HiF8 fallback path for HiF8 real quant.
+
+    Storage format:
+      - weight: uint8 tensor (native HiF8 byte code)
+      - weight_scale: compatibility placeholder (unused in native decode path)
+    Runtime:
+      - decode uint8 code -> compute dtype
+      - optional hif8 qdq on activation / output
+      - matmul via torch.mm / torch.addmm
+    """
+
+    def __init__(
+        self,
+        weight_name,
+        bias_name,
+        create_cuda_buffer=False,
+        create_cpu_buffer=False,
+        lazy_load=False,
+        lazy_load_file=None,
+        is_post_adapter=False,
+        lora_prefix="diffusion_model.blocks",
+        lora_path="",
+    ):
+        super().__init__(
+            weight_name,
+            bias_name,
+            create_cuda_buffer,
+            create_cpu_buffer,
+            lazy_load,
+            lazy_load_file,
+            is_post_adapter,
+            lora_prefix,
+            lora_path,
+        )
+        self.weight_need_transpose = True
+        self.scale_force_fp32 = True
+        # Runtime flags.
+        self.enable_hif8_act_qdq = True
+        self.enable_hif8_output_requant = False
+
+    def load(self, weight_dict):
+        self.load_quantized(weight_dict)
+        self.post_process()
+
+    @staticmethod
+    def _decode_hif8_code_scalar(code):
+        sign = (code >> 7) & 0x1
+        rem = code & 0x7F
+
+        if (rem & 0b1100000) == 0b1000000:
+            d, dot_len = 3, 2
+        elif (rem & 0b1100000) == 0b0100000:
+            d, dot_len = 2, 2
+        elif (rem & 0b1110000) == 0b0010000:
+            d, dot_len = 1, 3
+        elif (rem & 0b1111000) == 0b0001000:
+            d, dot_len = 0, 4
+        elif (rem & 0b1111000) == 0b0000000:
+            mant = rem & 0b111
+            if mant == 0:
+                return float('nan') if sign else 0.0
+            val = 2.0 ** (mant - 23)
+            return -val if sign else val
+        else:
+            return float('nan')
+
+        mant_width = 3 if d <= 2 else (2 if d == 3 else 1)
+        tail_bits = 7 - dot_len
+        payload = rem & ((1 << tail_bits) - 1)
+        exp_bits = payload >> mant_width if d > 0 else 0
+        mant = payload & ((1 << mant_width) - 1)
+
+        if d == 0:
+            e_dec = 0
+        else:
+            se = (exp_bits >> (d - 1)) & 0x1
+            mag_tail = exp_bits & ((1 << (d - 1)) - 1) if d > 1 else 0
+            mag = (1 << (d - 1)) | mag_tail
+            e_dec = -mag if se else mag
+
+        if abs(e_dec) == 15 and mant == (1 << mant_width) - 1:
+            return float('-inf') if sign else float('inf')
+
+        significand = 1.0 + mant / (2**mant_width)
+        val = significand * (2.0**e_dec)
+        return -val if sign else val
+
+    @classmethod
+    def _get_hif8_decode_table(cls, device):
+        if not hasattr(cls, '_hif8_decode_table_cpu'):
+            vals = [cls._decode_hif8_code_scalar(i) for i in range(256)]
+            cls._hif8_decode_table_cpu = torch.tensor(vals, dtype=torch.float32)
+        return cls._hif8_decode_table_cpu.to(device=device)
+
+    def _unpack_hif8_weight(self, dtype):
+        if self.weight.dtype != torch.uint8:
+            raise RuntimeError(
+                f"hif8-cuda expects uint8 native HiF8 weight container, but got {self.weight.dtype}."
+            )
+        lut = self._get_hif8_decode_table(self.weight.device)
+        return lut[self.weight.long()].to(dtype)
+
+    def _hif8_qdq(self, tensor):
+        x = tensor.float()
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+        eps = 2 ** (-14) if tensor.dtype == torch.float16 else 2 ** (-45)
+        e = torch.floor(torch.log2(x_unsigned + eps))
+        abse = e.abs()
+        mant_bits = torch.zeros_like(abse)
+        mant_bits[abse <= 15] = 1
+        mant_bits[abse <= 7] = 2
+        mant_bits[abse <= 3] = 3
+        qdq = (
+            torch.floor(x_unsigned * torch.exp2(-e + mant_bits) + 0.5)
+            * torch.exp2(e - mant_bits)
+            * sign
+        )
+        return qdq.to(tensor.dtype)
+
+    def apply(self, input_tensor):
+        shape = (input_tensor.shape[0], self.weight.shape[1])
+        dtype = input_tensor.dtype
+        device = input_tensor.device
+        output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
+
+        if self.enable_hif8_act_qdq:
+            input_tensor = self._hif8_qdq(input_tensor)
+        dequant_weight = self._unpack_hif8_weight(dtype)
+        dequant_weight = self._hif8_qdq(dequant_weight)
+        if not self.has_lora_branch:
+            if hasattr(self, "bias") and self.bias is not None:
+                out = torch.addmm(self._get_actual_bias(), input_tensor, dequant_weight, out=output_tensor)
+                return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
+            out = torch.mm(input_tensor, dequant_weight, out=output_tensor)
+            return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
+
+        if hasattr(self, "bias") and self.bias is not None:
+            out = torch.addmm(self._get_actual_bias(), input_tensor, dequant_weight, out=output_tensor) + self.apply_lora(input_tensor)
+            return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
+        out = torch.mm(input_tensor, dequant_weight, out=output_tensor) + self.apply_lora(input_tensor)
+        return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
+
+
+@MM_WEIGHT_REGISTER("hif8-fused")
+class MMWeightWhif8channelAhif8dynamicFusedV1(MMWeightWhif8channelAhif8dynamicFallback):
+    """
+    hif8-fused-v1:
+      - keep weight in uint8 native HiF8 code container
+      - decode per-K tile on-the-fly
+      - accumulate matmul without materializing full dequantized weight
+    """
+
+    def __init__(
+        self,
+        weight_name,
+        bias_name,
+        create_cuda_buffer=False,
+        create_cpu_buffer=False,
+        lazy_load=False,
+        lazy_load_file=None,
+        is_post_adapter=False,
+        lora_prefix="diffusion_model.blocks",
+        lora_path="",
+    ):
+        super().__init__(
+            weight_name,
+            bias_name,
+            create_cuda_buffer,
+            create_cpu_buffer,
+            lazy_load,
+            lazy_load_file,
+            is_post_adapter,
+            lora_prefix,
+            lora_path,
+        )
+        # v1: pure-PyTorch fused path with tiled decode+mm accumulation.
+        self.k_tile = 256
+
+    def _get_hif8_runtime(self):
+        runtime_cfg = {}
+        if isinstance(self.config, dict):
+            runtime_cfg = self.config.get("hif8_runtime", {}) or {}
+        return runtime_cfg if isinstance(runtime_cfg, dict) else {}
+
+    def apply(self, input_tensor):
+        shape = (input_tensor.shape[0], self.weight.shape[1])
+        dtype = input_tensor.dtype
+        device = input_tensor.device
+
+        runtime_cfg = self._get_hif8_runtime()
+        self.k_tile = int(runtime_cfg.get("k_tile", self.k_tile))
+        if self.k_tile <= 0:
+            self.k_tile = 256
+        self.enable_hif8_act_qdq = bool(runtime_cfg.get("enable_input_qdq", self.enable_hif8_act_qdq))
+        self.enable_hif8_output_requant = bool(runtime_cfg.get("enable_output_requant", self.enable_hif8_output_requant))
+
+        if self.enable_hif8_act_qdq:
+            input_tensor = self._hif8_qdq(input_tensor)
+
+        if self.weight.dtype != torch.uint8:
+            raise RuntimeError(
+                f"hif8-fused expects uint8 native HiF8 weight container, but got {self.weight.dtype}."
+            )
+
+        output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
+        if hasattr(self, "bias") and self.bias is not None:
+            output_tensor.copy_(self._get_actual_bias().unsqueeze(0).expand(shape[0], -1))
+        else:
+            output_tensor.zero_()
+
+        k_total = self.weight.shape[0]
+        lut = self._get_hif8_decode_table(self.weight.device)
+        for k_start in range(0, k_total, self.k_tile):
+            k_end = min(k_start + self.k_tile, k_total)
+            a_tile = input_tensor[:, k_start:k_end]
+            w_code_tile = self.weight[k_start:k_end, :]
+            w_tile = lut[w_code_tile.long()].to(dtype)
+            w_tile = self._hif8_qdq(w_tile)
+            output_tensor.addmm_(a_tile, w_tile)
+
+        if self.has_lora_branch:
+            output_tensor = output_tensor + self.apply_lora(input_tensor)
+        return self._hif8_qdq(output_tensor) if self.enable_hif8_output_requant else output_tensor
+
+
+@MM_WEIGHT_REGISTER("hif8-fused-kernel")
+class MMWeightWhif8channelAhif8dynamicFusedKernel(MMWeightWhif8channelAhif8dynamicFusedV1):
+    """
+    hif8-fused-v2 (kernel-first):
+      - try kernel op path first
+      - fallback to v1 pure-PyTorch tiled path if kernel is unavailable/fails
+    """
+
+    def __init__(
+        self,
+        weight_name,
+        bias_name,
+        create_cuda_buffer=False,
+        create_cpu_buffer=False,
+        lazy_load=False,
+        lazy_load_file=None,
+        is_post_adapter=False,
+        lora_prefix="diffusion_model.blocks",
+        lora_path="",
+    ):
+        super().__init__(
+            weight_name,
+            bias_name,
+            create_cuda_buffer,
+            create_cpu_buffer,
+            lazy_load,
+            lazy_load_file,
+            is_post_adapter,
+            lora_prefix,
+            lora_path,
+        )
+        self._kernel_fallback_warned = False
+
+    def _warn_kernel_fallback_once(self, reason):
+        if not self._kernel_fallback_warned:
+            logger.warning(f"[hif8-fused-kernel] fallback to hif8-fused-v1: {reason}")
+            self._kernel_fallback_warned = True
+
+    def apply(self, input_tensor):
+        runtime_cfg = self._get_hif8_runtime()
+        self.enable_hif8_act_qdq = bool(runtime_cfg.get("enable_input_qdq", self.enable_hif8_act_qdq))
+        self.enable_hif8_output_requant = bool(runtime_cfg.get("enable_output_requant", self.enable_hif8_output_requant))
+        compute_dtype = str(runtime_cfg.get("compute_dtype", "bf16")).lower()
+        if compute_dtype not in ["bf16", "fp16"]:
+            compute_dtype = "bf16"
+
+        # Keep semantics identical for LoRA branch in initial v2 rollout.
+        if self.has_lora_branch:
+            self._warn_kernel_fallback_once("LoRA branch is not enabled for kernel path in v2 initial rollout")
+            return super().apply(input_tensor)
+
+        if self.weight.dtype != torch.uint8:
+            self._warn_kernel_fallback_once(f"unexpected weight dtype {self.weight.dtype}")
+            return super().apply(input_tensor)
+
+        if hif8_fused_mm is None:
+            self._warn_kernel_fallback_once("lightx2v_kernel.gemm.hif8_fused_mm import failed")
+            return super().apply(input_tensor)
+
+        bias = self._get_actual_bias() if hasattr(self, "bias") and self.bias is not None else None
+        try:
+            out = hif8_fused_mm(
+                input_tensor=input_tensor,
+                weight=self.weight,
+                bias=bias,
+                enable_input_qdq=self.enable_hif8_act_qdq,
+                enable_output_requant=self.enable_hif8_output_requant,
+                compute_dtype=compute_dtype,
+            )
+            return out.to(dtype=input_tensor.dtype)
+        except Exception as e:
+            self._warn_kernel_fallback_once(repr(e))
+            return super().apply(input_tensor)
 
 
 @MM_WEIGHT_REGISTER("mxfp4")

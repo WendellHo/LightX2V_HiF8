@@ -113,3 +113,82 @@ class DefaultTensor:
             tensor = lazy_load_file.get_tensor(self.tensor_name).to(self.infer_dtype)
             self.pin_tensor = self.pin_tensor.copy_(tensor)
         del tensor
+
+
+@TENSOR_REGISTER("Optional")
+class OptionalTensor(DefaultTensor):
+    def _load_default_tensors(self, weight_dict):
+        if self.tensor_name not in weight_dict:
+            self.tensor = None
+            return
+        super()._load_default_tensors(weight_dict)
+
+    def _get_tensor(self, weight_dict=None, use_infer_dtype=False):
+        if self.lazy_load:
+            if Path(self.lazy_load_file).is_file():
+                lazy_load_file_path = self.lazy_load_file
+            else:
+                parts = self.tensor_name.split('.')
+                block_idx = parts[1] if len(parts) > 1 else '0'
+                lazy_load_file_path = os.path.join(
+                    self.lazy_load_file, f"block_{block_idx}.safetensors"
+                )
+            with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
+                if self.tensor_name not in lazy_load_file.keys():
+                    return None
+                tensor = lazy_load_file.get_tensor(self.tensor_name)
+                if use_infer_dtype:
+                    tensor = tensor.to(self.infer_dtype)
+            return tensor
+        if weight_dict is None or self.tensor_name not in weight_dict:
+            return None
+        return weight_dict[self.tensor_name]
+
+    def _load_cuda_buffer(self, weight_dict):
+        tensor = self._get_tensor(weight_dict, use_infer_dtype=self.lazy_load)
+        if tensor is None:
+            self.tensor = None
+            return
+        self.tensor_cuda_buffer = tensor.to(AI_DEVICE)
+
+    def _load_cpu_pin_buffer(self):
+        tensor = self._get_tensor(use_infer_dtype=True)
+        if tensor is None:
+            self.tensor = None
+            return
+        self.pin_tensor = self._create_cpu_pin_tensor(tensor)
+
+    def to_cuda(self, non_blocking=False):
+        if hasattr(self, "pin_tensor"):
+            self.tensor = self.pin_tensor.to(AI_DEVICE, non_blocking=non_blocking)
+        elif hasattr(self, "tensor") and self.tensor is not None:
+            self.tensor = self.tensor.to(AI_DEVICE, non_blocking=non_blocking)
+        else:
+            tensor = self._get_tensor(use_infer_dtype=True)
+            self.tensor = None if tensor is None else tensor.to(AI_DEVICE, non_blocking=non_blocking)
+
+    def to_cpu(self, non_blocking=False):
+        if not hasattr(self, "tensor") or self.tensor is None:
+            return
+        if hasattr(self, "pin_tensor"):
+            self.tensor = self.pin_tensor.copy_(self.tensor, non_blocking=non_blocking).cpu()
+        else:
+            self.tensor = self.tensor.to("cpu", non_blocking=non_blocking)
+
+    def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
+        if self.is_post_adapter:
+            assert adapter_block_index is not None
+            self.tensor_name = re.sub(r"\.\d+", lambda m: f".{adapter_block_index}", self.tensor_name, count=1)
+        else:
+            self.tensor_name = re.sub(r"\.\d+", lambda m: f".{block_index}", self.tensor_name, count=1)
+        if Path(self.lazy_load_file).is_file():
+            lazy_load_file_path = self.lazy_load_file
+        else:
+            lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{block_index}.safetensors")
+        with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
+            if self.tensor_name not in lazy_load_file.keys():
+                self.tensor = None
+                return
+            tensor = lazy_load_file.get_tensor(self.tensor_name).to(self.infer_dtype)
+            self.pin_tensor = self.pin_tensor.copy_(tensor)
+        del tensor

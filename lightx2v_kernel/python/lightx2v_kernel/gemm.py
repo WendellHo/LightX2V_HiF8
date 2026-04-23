@@ -1,6 +1,52 @@
 import torch
 
 
+def hif8_fused_mm(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    enable_input_qdq: bool = True,
+    enable_output_requant: bool = False,
+    compute_dtype: str = "bf16",
+):
+    """
+    HiF8 fused MM kernel wrapper.
+
+    Expected op schema:
+      hif8_fused_mm_sm86(
+        Tensor! out, Tensor input, Tensor weight_u8,
+        Tensor? bias, bool enable_input_qdq, bool enable_output_requant, str compute_dtype
+      ) -> ()
+    """
+    op_namespace = torch.ops.lightx2v_kernel
+    op_name = None
+    if hasattr(op_namespace, "hif8_fused_mm_sm86"):
+        op_name = "hif8_fused_mm_sm86"
+    elif hasattr(op_namespace, "hif8_fused_mm_sm120"):
+        # Compat path in case downstream adds a sm120 variant first.
+        op_name = "hif8_fused_mm_sm120"
+    else:
+        raise NotImplementedError("lightx2v_kernel hif8 fused mm op is not registered")
+
+    if compute_dtype == "fp16":
+        out_dtype = torch.float16
+    else:
+        out_dtype = torch.bfloat16
+
+    out_shape = (input_tensor.shape[0], weight.shape[1])
+    out = torch.empty(out_shape, dtype=out_dtype, device=input_tensor.device)
+    getattr(op_namespace, op_name).default(
+        out,
+        input_tensor,
+        weight,
+        bias,
+        enable_input_qdq,
+        enable_output_requant,
+        compute_dtype,
+    )
+    return out
+
+
 def cutlass_scaled_nvfp4_mm(mat_a, mat_b, scales_a, scales_b, alpha, bias=None):
     m, n = mat_a.shape[0], mat_b.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=mat_a.device)

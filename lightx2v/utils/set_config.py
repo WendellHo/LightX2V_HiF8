@@ -42,6 +42,10 @@ def set_args2config(args):
 
 
 def auto_calc_config(config):
+    # Keep runtime/user overrides so model-side config.json won't force a fixed quant path.
+    user_dit_quant_scheme = config.get("dit_quant_scheme", None)
+    user_dit_quantized = config.get("dit_quantized", None)
+
     if config.get("config_json", None) is not None:
         logger.info(f"Loading some config from {config['config_json']}")
         with open(config["config_json"], "r") as f:
@@ -128,6 +132,14 @@ def auto_calc_config(config):
                 config["vae_scale_factor"] = 2 ** len(vae_config["temperal_downsample"])
             elif "block_out_channels" in vae_config:
                 config["vae_scale_factor"] = 2 ** (len(vae_config["block_out_channels"]) - 1)
+
+    # Re-apply runtime/user explicit quant settings after all model config merges.
+    if user_dit_quant_scheme is not None:
+        config["dit_quant_scheme"] = user_dit_quant_scheme
+    if user_dit_quantized is not None:
+        config["dit_quantized"] = user_dit_quantized
+    if config.get("dit_quantized", False):
+        logger.info(f"Effective dit_quant_scheme: {config.get('dit_quant_scheme', 'Default')}")
 
     return config
 

@@ -72,12 +72,10 @@ set(LIGHTX2V_KERNEL_CUDA_FLAGS
 
 
 list(APPEND LIGHTX2V_KERNEL_CUDA_FLAGS
-    # "-gencode=arch=compute_90,code=sm_90"
-    # "-gencode=arch=compute_90a,code=sm_90a"
-    # "-gencode=arch=compute_100,code=sm_100"
-    # "-gencode=arch=compute_100a,code=sm_100a"
-    # "-gencode=arch=compute_120,code=sm_120"
-    "-gencode=arch=compute_120a,code=sm_120a"
+    # RTX3090 (Ampere)
+    "-gencode=arch=compute_86,code=sm_86"
+    # Keep optional support for newer arch if toolchain supports it.
+    # "-gencode=arch=compute_120a,code=sm_120a"
 )
 
 
@@ -90,6 +88,7 @@ set(SOURCES
     "csrc/gemm/mxfp4_scaled_mm_kernels_sm120.cu"
     "csrc/gemm/mxfp6_mxfp8_scaled_mm_kernels_sm120.cu"
     "csrc/gemm/mxfp8_scaled_mm_kernels_sm120.cu"
+    "csrc/gemm/hif8_fused_mm_kernels_sm86.cu"
     "csrc/common_extension.cc"
 )
 
