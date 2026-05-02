@@ -772,11 +772,18 @@ class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
         self.post_process()
 
     @staticmethod
+    def _is_hif8_inf_payload(e_dec, mant, mant_width):
+        # Only the max positive normal payload is reserved for infinity.
+        return e_dec == 15 and mant == ((1 << mant_width) - 1)
+
+    @staticmethod
     def _decode_hif8_code_scalar(code):
         sign = (code >> 7) & 0x1
         rem = code & 0x7F
 
-        if (rem & 0b1100000) == 0b1000000:
+        if (rem & 0b1100000) == 0b1100000:
+            d, dot_len = 4, 2
+        elif (rem & 0b1100000) == 0b1000000:
             d, dot_len = 3, 2
         elif (rem & 0b1100000) == 0b0100000:
             d, dot_len = 2, 2
@@ -793,7 +800,12 @@ class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
         else:
             return float('nan')
 
-        mant_width = 3 if d <= 2 else (2 if d == 3 else 1)
+        if d <= 2:
+            mant_width = 3
+        elif d == 3:
+            mant_width = 2
+        else:
+            mant_width = 1
         tail_bits = 7 - dot_len
         payload = rem & ((1 << tail_bits) - 1)
         exp_bits = payload >> mant_width if d > 0 else 0
@@ -807,7 +819,9 @@ class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
             mag = (1 << (d - 1)) | mag_tail
             e_dec = -mag if se else mag
 
-        if abs(e_dec) == 15 and mant == (1 << mant_width) - 1:
+        if MMWeightWhif8channelAhif8dynamicFallback._is_hif8_inf_payload(
+            e_dec, mant, mant_width
+        ):
             return float('-inf') if sign else float('inf')
 
         significand = 1.0 + mant / (2**mant_width)
@@ -833,19 +847,44 @@ class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
         x = tensor.float()
         x_unsigned = torch.abs(x)
         sign = torch.sign(x)
-        eps = 2 ** (-14) if tensor.dtype == torch.float16 else 2 ** (-45)
-        e = torch.floor(torch.log2(x_unsigned + eps))
-        abse = e.abs()
-        mant_bits = torch.zeros_like(abse)
-        mant_bits[abse <= 15] = 1
-        mant_bits[abse <= 7] = 2
-        mant_bits[abse <= 3] = 3
-        qdq = (
-            torch.floor(x_unsigned * torch.exp2(-e + mant_bits) + 0.5)
-            * torch.exp2(e - mant_bits)
-            * sign
-        )
-        return qdq.to(tensor.dtype)
+
+        out = torch.zeros_like(x)
+        nan_mask = torch.isnan(x)
+        pos_inf_mask = torch.isposinf(x)
+        neg_inf_mask = torch.isneginf(x)
+        finite_mask = ~(nan_mask | pos_inf_mask | neg_inf_mask)
+
+        out[nan_mask] = torch.nan
+        out[pos_inf_mask] = torch.inf
+        out[neg_inf_mask] = -torch.inf
+
+        if bool(finite_mask.any().item()):
+            finite_abs = x_unsigned[finite_mask]
+            finite_sign = sign[finite_mask]
+
+            overflow_mask = finite_abs >= (2.0 ** 15 * 1.25)
+            underflow_mask = finite_abs < (2.0 ** (-23))
+            quant_mask = ~(overflow_mask | underflow_mask)
+
+            finite_out = torch.zeros_like(finite_abs)
+            finite_out[overflow_mask] = finite_sign[overflow_mask] * torch.inf
+
+            if bool(quant_mask.any().item()):
+                quant_abs = finite_abs[quant_mask]
+                quant_sign = finite_sign[quant_mask]
+                e = torch.floor(torch.log2(quant_abs))
+                e = torch.where(e <= -23, torch.full_like(e, -22), e)
+                abse = e.abs()
+                mant_bits = torch.zeros_like(abse)
+                mant_bits[abse <= 15] = 1.0
+                mant_bits[abse <= 7] = 2.0
+                mant_bits[abse <= 3] = 3.0
+                q = torch.floor(quant_abs * torch.exp2(-e + mant_bits) + 0.5)
+                finite_out[quant_mask] = q * torch.exp2(e - mant_bits) * quant_sign
+
+            out[finite_mask] = finite_out
+
+        return out.to(tensor.dtype)
 
     def _get_hif8_runtime(self):
         runtime_cfg = {}

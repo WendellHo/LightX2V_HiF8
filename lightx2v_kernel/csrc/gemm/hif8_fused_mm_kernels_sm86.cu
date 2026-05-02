@@ -28,7 +28,10 @@ __device__ __forceinline__ float hif8_decode_u8(uint8_t code) {
 
   int d = -1;
   int dot_len = 0;
-  if ((rem & 0b1100000) == 0b1000000) {         // 10
+  if ((rem & 0b1100000) == 0b1100000) {         // 11
+    d = 4;
+    dot_len = 2;
+  } else if ((rem & 0b1100000) == 0b1000000) {  // 10
     d = 3;
     dot_len = 2;
   } else if ((rem & 0b1100000) == 0b0100000) {  // 01
@@ -65,8 +68,7 @@ __device__ __forceinline__ float hif8_decode_u8(uint8_t code) {
     e_dec = se ? -mag : mag;
   }
 
-  const int abs_e = e_dec < 0 ? -e_dec : e_dec;
-  if (abs_e == 15 && mant == ((1 << mant_width) - 1)) {
+  if (e_dec == 15 && mant == ((1 << mant_width) - 1)) {
     return sign ? -CUDART_INF_F : CUDART_INF_F;
   }
 
@@ -76,17 +78,35 @@ __device__ __forceinline__ float hif8_decode_u8(uint8_t code) {
 }
 
 __device__ __forceinline__ float hif8_qdq_scalar(float x, float eps) {
-  float x_unsigned = fabsf(x);
-  float sign = x >= 0.0f ? 1.0f : -1.0f;
-  float e = floorf(log2f(x_unsigned + eps));
+  (void)eps;
+  if (isnan(x) || isinf(x)) {
+    return x;
+  }
+
+  const float x_unsigned = fabsf(x);
+  const float sign = x >= 0.0f ? 1.0f : -1.0f;
+  if (x_unsigned < exp2f(-23.0f)) {
+    return 0.0f;
+  }
+  if (x_unsigned >= exp2f(15.0f) * 1.25f) {
+    return sign * CUDART_INF_F;
+  }
+
+  float e = floorf(log2f(x_unsigned));
+  if (e <= -23.0f) {
+    e = -22.0f;
+  }
+
   float abse = fabsf(e);
   float mant_bits = 0.0f;
+  if (abse <= 15.0f) {
+    mant_bits = 1.0f;
+  }
+  if (abse <= 7.0f) {
+    mant_bits = 2.0f;
+  }
   if (abse <= 3.0f) {
     mant_bits = 3.0f;
-  } else if (abse <= 7.0f) {
-    mant_bits = 2.0f;
-  } else if (abse <= 15.0f) {
-    mant_bits = 1.0f;
   }
   float q = floorf(x_unsigned * exp2f(-e + mant_bits) + 0.5f);
   return q * exp2f(e - mant_bits) * sign;
