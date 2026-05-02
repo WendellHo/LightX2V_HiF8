@@ -26,6 +26,15 @@ class WeightModule:
             if hasattr(parameter, "load"):
                 parameter.load(weight_dict)
 
+    def set_config(self, config=None):
+        for _, module in self._modules.items():
+            if hasattr(module, "set_config"):
+                module.set_config(config)
+
+        for _, parameter in self._parameters.items():
+            if hasattr(parameter, "set_config"):
+                parameter.set_config(config)
+
     def register_diff(self, weight_dict):
         for _, module in self._modules.items():
             if hasattr(module, "register_diff"):

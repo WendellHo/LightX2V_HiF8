@@ -284,6 +284,26 @@ class WanSelfAttention(WeightModule):
                     self.lazy_load_file,
                 ),
             )
+            self.add_module(
+                "self_attn_q_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.q.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_q_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.q.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
 
         self.add_module(
             "self_attn_k",
@@ -303,6 +323,26 @@ class WanSelfAttention(WeightModule):
                 "self_attn_k_htg_group_bias",
                 TENSOR_REGISTER["Optional"](
                     f"{block_prefix}.{self.block_index}.self_attn.k.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_k_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.k.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_k_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.k.hiband_group_act_scales",
                     create_cuda_buffer,
                     create_cpu_buffer,
                     self.lazy_load,
@@ -333,6 +373,26 @@ class WanSelfAttention(WeightModule):
                     self.lazy_load_file,
                 ),
             )
+            self.add_module(
+                "self_attn_v_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.v.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_v_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.v.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "self_attn_o",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -346,6 +406,67 @@ class WanSelfAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "self_attn_o_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.o.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_o_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.o.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_o_htg_input_shift",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.o.htg_input_shift",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_o_htg_input_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.o.htg_input_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_o_htg_group_boundaries",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.o.htg_group_boundaries",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "self_attn_o_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.self_attn.o.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "self_attn_norm_q",
             RMS_WEIGHT_REGISTER[self.attn_rms_norm_type](
@@ -536,6 +657,7 @@ class WanCrossAttention(WeightModule):
         self.mm_type = mm_type
         self.task = task
         self.config = config
+        self.quant_method = config.get("quant_method", None)
         self.lazy_load = lazy_load
         self.lazy_load_file = lazy_load_file
 
@@ -557,6 +679,37 @@ class WanCrossAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "cross_attn_htg_boundaries",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.norm3.htg_group_boundaries",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_htg_norm_weight",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.norm3.htg_norm_weight",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_htg_norm_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.norm3.htg_norm_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "cross_attn_q",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -570,6 +723,37 @@ class WanCrossAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "cross_attn_q_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.q.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_q_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.q.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_q_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.q.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "cross_attn_k",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -583,6 +767,27 @@ class WanCrossAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "cross_attn_k_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.k.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_k_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.k.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "cross_attn_v",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -596,6 +801,27 @@ class WanCrossAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "cross_attn_v_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.v.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_v_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.v.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "cross_attn_o",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -609,6 +835,67 @@ class WanCrossAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "cross_attn_o_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.o.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_o_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.o.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_o_htg_input_shift",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.o.htg_input_shift",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_o_htg_input_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.o.htg_input_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_o_htg_group_boundaries",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.o.htg_group_boundaries",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "cross_attn_o_htg_group_bias",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.cross_attn.o.htg_group_bias",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "cross_attn_norm_q",
             RMS_WEIGHT_REGISTER[self.attn_rms_norm_type](
@@ -649,6 +936,27 @@ class WanCrossAttention(WeightModule):
                     lora_path=lora_path,
                 ),
             )
+            if self.quant_method in ["advanced_ptq"]:
+                self.add_module(
+                    "cross_attn_k_img_hiband_act_scale",
+                    TENSOR_REGISTER["Optional"](
+                        f"{block_prefix}.{self.block_index}.cross_attn.k_img.hiband_act_scale",
+                        create_cuda_buffer,
+                        create_cpu_buffer,
+                        self.lazy_load,
+                        self.lazy_load_file,
+                    ),
+                )
+                self.add_module(
+                    "cross_attn_k_img_hiband_group_act_scales",
+                    TENSOR_REGISTER["Optional"](
+                        f"{block_prefix}.{self.block_index}.cross_attn.k_img.hiband_group_act_scales",
+                        create_cuda_buffer,
+                        create_cpu_buffer,
+                        self.lazy_load,
+                        self.lazy_load_file,
+                    ),
+                )
             self.add_module(
                 "cross_attn_v_img",
                 MM_WEIGHT_REGISTER[self.mm_type](
@@ -662,6 +970,27 @@ class WanCrossAttention(WeightModule):
                     lora_path=lora_path,
                 ),
             )
+            if self.quant_method in ["advanced_ptq"]:
+                self.add_module(
+                    "cross_attn_v_img_hiband_act_scale",
+                    TENSOR_REGISTER["Optional"](
+                        f"{block_prefix}.{self.block_index}.cross_attn.v_img.hiband_act_scale",
+                        create_cuda_buffer,
+                        create_cpu_buffer,
+                        self.lazy_load,
+                        self.lazy_load_file,
+                    ),
+                )
+                self.add_module(
+                    "cross_attn_v_img_hiband_group_act_scales",
+                    TENSOR_REGISTER["Optional"](
+                        f"{block_prefix}.{self.block_index}.cross_attn.v_img.hiband_group_act_scales",
+                        create_cuda_buffer,
+                        create_cpu_buffer,
+                        self.lazy_load,
+                        self.lazy_load_file,
+                    ),
+                )
             self.add_module(
                 "cross_attn_norm_k_img",
                 RMS_WEIGHT_REGISTER[self.attn_rms_norm_type](
@@ -729,6 +1058,26 @@ class WanFFN(WeightModule):
                     self.lazy_load_file,
                 ),
             )
+            self.add_module(
+                "ffn_0_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.ffn.0.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "ffn_0_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.ffn.0.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
         self.add_module(
             "ffn_2",
             MM_WEIGHT_REGISTER[self.mm_type](
@@ -742,6 +1091,27 @@ class WanFFN(WeightModule):
                 lora_path=lora_path,
             ),
         )
+        if self.quant_method in ["advanced_ptq"]:
+            self.add_module(
+                "ffn_2_hiband_act_scale",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.ffn.2.hiband_act_scale",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
+            self.add_module(
+                "ffn_2_hiband_group_act_scales",
+                TENSOR_REGISTER["Optional"](
+                    f"{block_prefix}.{self.block_index}.ffn.2.hiband_group_act_scales",
+                    create_cuda_buffer,
+                    create_cpu_buffer,
+                    self.lazy_load,
+                    self.lazy_load_file,
+                ),
+            )
 
         if self.quant_method in ["advanced_ptq"]:
             self.add_module(

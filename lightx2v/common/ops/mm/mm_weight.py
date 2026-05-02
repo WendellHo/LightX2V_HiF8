@@ -166,6 +166,8 @@ class MMWeightTemplate(metaclass=ABCMeta):
             return bias + self.bias_diff
         else:
             if not hasattr(self, "bias") or self.bias is None:
+                if hasattr(self, "bias_diff"):
+                    return self.bias_diff
                 return None
             if not hasattr(self, "bias_diff"):
                 return self.bias
@@ -312,13 +314,14 @@ class MMWeight(MMWeightTemplate):
         device = input_tensor.device
         output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
 
+        actual_bias = self._get_actual_bias()
         if not self.has_lora_branch:
-            if hasattr(self, "bias") and self.bias is not None:
-                return torch.addmm(self._get_actual_bias(), input_tensor, self._get_actual_weight(), out=output_tensor)
+            if actual_bias is not None:
+                return torch.addmm(actual_bias, input_tensor, self._get_actual_weight(), out=output_tensor)
             return torch.mm(input_tensor, self._get_actual_weight(), out=output_tensor)
         else:
-            if hasattr(self, "bias") and self.bias is not None:
-                return torch.addmm(self._get_actual_bias(), input_tensor, self._get_actual_weight(), out=output_tensor) + self.apply_lora(input_tensor)
+            if actual_bias is not None:
+                return torch.addmm(actual_bias, input_tensor, self._get_actual_weight(), out=output_tensor) + self.apply_lora(input_tensor)
             return torch.mm(input_tensor, self._get_actual_weight(), out=output_tensor) + self.apply_lora(input_tensor)
 
     def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
@@ -762,6 +765,7 @@ class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
         # Runtime flags.
         self.enable_hif8_act_qdq = True
         self.enable_hif8_output_requant = False
+        self.enable_hiband = False
 
     def load(self, weight_dict):
         self.load_quantized(weight_dict)
@@ -843,25 +847,61 @@ class MMWeightWhif8channelAhif8dynamicFallback(MMWeightQuantTemplate):
         )
         return qdq.to(tensor.dtype)
 
+    def _get_hif8_runtime(self):
+        runtime_cfg = {}
+        if isinstance(self.config, dict):
+            runtime_cfg = self.config.get("hif8_runtime", {}) or {}
+        return runtime_cfg if isinstance(runtime_cfg, dict) else {}
+
+    def _get_hiband_act_scale(self, runtime_cfg):
+        hiband_enabled = bool(runtime_cfg.get("hiband_enabled", False))
+        if not hiband_enabled:
+            return None
+        scale = getattr(self, "hiband_act_scale", None)
+        if scale is None:
+            return None
+        if not torch.is_tensor(scale):
+            return None
+        return scale
+
+    def _apply_hif8_input_qdq(self, input_tensor, runtime_cfg):
+        self.enable_hif8_act_qdq = bool(
+            runtime_cfg.get("enable_input_qdq", self.enable_hif8_act_qdq)
+        )
+        self.enable_hif8_output_requant = bool(runtime_cfg.get("enable_output_requant", self.enable_hif8_output_requant))
+        if not self.enable_hif8_act_qdq:
+            return input_tensor
+
+        hiband_scale = self._get_hiband_act_scale(runtime_cfg)
+        if hiband_scale is None:
+            return self._hif8_qdq(input_tensor)
+
+        scale = hiband_scale.to(device=input_tensor.device, dtype=input_tensor.dtype).view(1, -1)
+        # HiBand Phase1: x_hat = s * Q_hif8(x / s) before GEMM.
+        return self._hif8_qdq(input_tensor / scale) * scale
+
     def apply(self, input_tensor):
         shape = (input_tensor.shape[0], self.weight.shape[1])
         dtype = input_tensor.dtype
         device = input_tensor.device
         output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
 
-        if self.enable_hif8_act_qdq:
-            input_tensor = self._hif8_qdq(input_tensor)
+        runtime_cfg = self._get_hif8_runtime()
+        input_tensor = self._apply_hif8_input_qdq(input_tensor, runtime_cfg)
+        # Weight-side HiF8/HiBand is fully materialized offline before export.
+        # Runtime must only decode the packed native HiF8 codes here; applying
+        # another QDQ on decoded weights would introduce an extra rounding pass.
         dequant_weight = self._unpack_hif8_weight(dtype)
-        dequant_weight = self._hif8_qdq(dequant_weight)
+        actual_bias = self._get_actual_bias()
         if not self.has_lora_branch:
-            if hasattr(self, "bias") and self.bias is not None:
-                out = torch.addmm(self._get_actual_bias(), input_tensor, dequant_weight, out=output_tensor)
+            if actual_bias is not None:
+                out = torch.addmm(actual_bias, input_tensor, dequant_weight, out=output_tensor)
                 return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
             out = torch.mm(input_tensor, dequant_weight, out=output_tensor)
             return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
 
-        if hasattr(self, "bias") and self.bias is not None:
-            out = torch.addmm(self._get_actual_bias(), input_tensor, dequant_weight, out=output_tensor) + self.apply_lora(input_tensor)
+        if actual_bias is not None:
+            out = torch.addmm(actual_bias, input_tensor, dequant_weight, out=output_tensor) + self.apply_lora(input_tensor)
             return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
         out = torch.mm(input_tensor, dequant_weight, out=output_tensor) + self.apply_lora(input_tensor)
         return self._hif8_qdq(out) if self.enable_hif8_output_requant else out
@@ -902,12 +942,6 @@ class MMWeightWhif8channelAhif8dynamicFusedV1(MMWeightWhif8channelAhif8dynamicFa
         # v1: pure-PyTorch fused path with tiled decode+mm accumulation.
         self.k_tile = 256
 
-    def _get_hif8_runtime(self):
-        runtime_cfg = {}
-        if isinstance(self.config, dict):
-            runtime_cfg = self.config.get("hif8_runtime", {}) or {}
-        return runtime_cfg if isinstance(runtime_cfg, dict) else {}
-
     def apply(self, input_tensor):
         shape = (input_tensor.shape[0], self.weight.shape[1])
         dtype = input_tensor.dtype
@@ -917,11 +951,7 @@ class MMWeightWhif8channelAhif8dynamicFusedV1(MMWeightWhif8channelAhif8dynamicFa
         self.k_tile = int(runtime_cfg.get("k_tile", self.k_tile))
         if self.k_tile <= 0:
             self.k_tile = 256
-        self.enable_hif8_act_qdq = bool(runtime_cfg.get("enable_input_qdq", self.enable_hif8_act_qdq))
-        self.enable_hif8_output_requant = bool(runtime_cfg.get("enable_output_requant", self.enable_hif8_output_requant))
-
-        if self.enable_hif8_act_qdq:
-            input_tensor = self._hif8_qdq(input_tensor)
+        input_tensor = self._apply_hif8_input_qdq(input_tensor, runtime_cfg)
 
         if self.weight.dtype != torch.uint8:
             raise RuntimeError(
@@ -929,8 +959,9 @@ class MMWeightWhif8channelAhif8dynamicFusedV1(MMWeightWhif8channelAhif8dynamicFa
             )
 
         output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
-        if hasattr(self, "bias") and self.bias is not None:
-            output_tensor.copy_(self._get_actual_bias().unsqueeze(0).expand(shape[0], -1))
+        actual_bias = self._get_actual_bias()
+        if actual_bias is not None:
+            output_tensor.copy_(actual_bias.unsqueeze(0).expand(shape[0], -1))
         else:
             output_tensor.zero_()
 
@@ -941,7 +972,6 @@ class MMWeightWhif8channelAhif8dynamicFusedV1(MMWeightWhif8channelAhif8dynamicFa
             a_tile = input_tensor[:, k_start:k_end]
             w_code_tile = self.weight[k_start:k_end, :]
             w_tile = lut[w_code_tile.long()].to(dtype)
-            w_tile = self._hif8_qdq(w_tile)
             output_tensor.addmm_(a_tile, w_tile)
 
         if self.has_lora_branch:
@@ -989,11 +1019,17 @@ class MMWeightWhif8channelAhif8dynamicFusedKernel(MMWeightWhif8channelAhif8dynam
 
     def apply(self, input_tensor):
         runtime_cfg = self._get_hif8_runtime()
-        self.enable_hif8_act_qdq = bool(runtime_cfg.get("enable_input_qdq", self.enable_hif8_act_qdq))
-        self.enable_hif8_output_requant = bool(runtime_cfg.get("enable_output_requant", self.enable_hif8_output_requant))
         compute_dtype = str(runtime_cfg.get("compute_dtype", "bf16")).lower()
         if compute_dtype not in ["bf16", "fp16"]:
             compute_dtype = "bf16"
+        enable_input_qdq = bool(runtime_cfg.get("enable_input_qdq", self.enable_hif8_act_qdq))
+        hiband_scale = self._get_hiband_act_scale(runtime_cfg) if enable_input_qdq else None
+        if hiband_scale is not None:
+            scale = hiband_scale.to(device=input_tensor.device, dtype=input_tensor.dtype).view(1, -1)
+            input_tensor = self._hif8_qdq(input_tensor / scale) * scale
+            enable_input_qdq = False
+        self.enable_hif8_act_qdq = enable_input_qdq
+        self.enable_hif8_output_requant = bool(runtime_cfg.get("enable_output_requant", self.enable_hif8_output_requant))
 
         # Keep semantics identical for LoRA branch in initial v2 rollout.
         if self.has_lora_branch:
@@ -1008,13 +1044,13 @@ class MMWeightWhif8channelAhif8dynamicFusedKernel(MMWeightWhif8channelAhif8dynam
             self._warn_kernel_fallback_once("lightx2v_kernel.gemm.hif8_fused_mm import failed")
             return super().apply(input_tensor)
 
-        bias = self._get_actual_bias() if hasattr(self, "bias") and self.bias is not None else None
+        bias = self._get_actual_bias()
         try:
             out = hif8_fused_mm(
                 input_tensor=input_tensor,
                 weight=self.weight,
                 bias=bias,
-                enable_input_qdq=self.enable_hif8_act_qdq,
+                enable_input_qdq=enable_input_qdq,
                 enable_output_requant=self.enable_hif8_output_requant,
                 compute_dtype=compute_dtype,
             )
@@ -1912,8 +1948,9 @@ class MMWeightWfp8block128Afp8channelgroup128dynamicDeepgemmActSgl(MMWeightQuant
             (self.weight, self.weight_scale),
             output_tensor,
         )
-        if hasattr(self, "bias") and self.bias is not None:
-            output_tensor.add_(self._get_actual_bias())
+        actual_bias = self._get_actual_bias()
+        if actual_bias is not None:
+            output_tensor.add_(actual_bias)
         if self.has_lora_branch:
             return output_tensor + self.apply_lora(input_tensor)
         return output_tensor

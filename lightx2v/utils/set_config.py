@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 
@@ -45,12 +46,23 @@ def auto_calc_config(config):
     # Keep runtime/user overrides so model-side config.json won't force a fixed quant path.
     user_dit_quant_scheme = config.get("dit_quant_scheme", None)
     user_dit_quantized = config.get("dit_quantized", None)
+    config_json_overrides = {}
 
     if config.get("config_json", None) is not None:
         logger.info(f"Loading some config from {config['config_json']}")
         with open(config["config_json"], "r") as f:
             config_json = json.load(f)
         config.update(config_json)
+        # Values coming from the runtime config_json should override model-side
+        # exported quant metadata after all later merges.
+        for key in [
+            "dit_quant_scheme",
+            "dit_quantized",
+            "quant_method",
+            "hif8_runtime",
+        ]:
+            if key in config_json:
+                config_json_overrides[key] = copy.deepcopy(config_json[key])
 
     assert os.path.exists(config["model_path"]), f"Model path not found: {config['model_path']}"
 
@@ -133,7 +145,11 @@ def auto_calc_config(config):
             elif "block_out_channels" in vae_config:
                 config["vae_scale_factor"] = 2 ** (len(vae_config["block_out_channels"]) - 1)
 
-    # Re-apply runtime/user explicit quant settings after all model config merges.
+    # Re-apply runtime config_json quant settings after all model config merges.
+    for key, value in config_json_overrides.items():
+        config[key] = value
+
+    # Re-apply explicit CLI/user settings after all model config merges.
     if user_dit_quant_scheme is not None:
         config["dit_quant_scheme"] = user_dit_quant_scheme
     if user_dit_quantized is not None:

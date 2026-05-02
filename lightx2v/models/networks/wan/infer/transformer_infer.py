@@ -20,6 +20,22 @@ def modulate(x, scale, shift):
 class WanTransformerInfer(BaseTransformerInfer):
     def __init__(self, config):
         self.config = config
+        hif8_runtime = config.get("hif8_runtime", {}) if isinstance(config, dict) else {}
+        self.hiband_runtime_enabled = bool(
+            hif8_runtime.get("hiband_enabled", False)
+        ) if isinstance(hif8_runtime, dict) else False
+        self.hiband_runtime_group_act_scale_enabled = bool(
+            hif8_runtime.get("hiband_runtime_group_act_scale_enabled", False)
+        ) if isinstance(hif8_runtime, dict) else False
+        self.hiband_group_source = (
+            str(hif8_runtime.get("hiband_group_source", "htg")).lower()
+            if isinstance(hif8_runtime, dict) else "htg"
+        )
+        self.hiband_fallback_global_act_scale = bool(
+            hif8_runtime.get("hiband_fallback_global_act_scale", True)
+        ) if isinstance(hif8_runtime, dict) else True
+        self._hiband_tensor_context = {}
+        self._current_htg_group_idx = 0
         self.task = config["task"]
         self.attention_type = config.get("attention_type", "flash_attn2")
         self.self_attn_1_type = config.get("self_attn_1_type", "flash_attn2")
@@ -88,6 +104,7 @@ class WanTransformerInfer(BaseTransformerInfer):
         self.cross_attn_cu_seqlens_q = None
         self.cross_attn_cu_seqlens_kv = None
         self.cross_attn_cu_seqlens_kv_img = None
+        self._current_htg_group_idx = 0
         if self.has_post_adapter:
             self.reset_post_adapter_states()
 
@@ -122,7 +139,39 @@ class WanTransformerInfer(BaseTransformerInfer):
         group_idx = max(0, min(group_idx, tensor.shape[0] - 1))
         return tensor[group_idx]
 
+    def _get_phase_tensor(self, phase, name):
+        if not hasattr(phase, name):
+            return None
+        tensor_holder = getattr(phase, name)
+        return getattr(tensor_holder, "tensor", None)
+
+    def _resolve_hiband_tensor(self, global_tensor, group_tensor=None, group_idx=None):
+        if (
+            self.hiband_runtime_enabled
+            and self.hiband_runtime_group_act_scale_enabled
+            and self.hiband_group_source == "htg"
+            and group_tensor is not None
+            and group_idx is not None
+        ):
+            selected = self._select_group_tensor(group_tensor, group_idx)
+            if selected is not None:
+                return selected
+            if not self.hiband_fallback_global_act_scale:
+                return None
+        return global_tensor
+
     def _mm_apply_with_group_bias(self, mm_module, input_tensor, grouped_bias_tensor, group_idx):
+        if self.hiband_runtime_enabled:
+            hiband_scale_name = getattr(mm_module, "_hiband_scale_name", None)
+            hiband_tensor = (
+                getattr(self, "_hiband_tensor_context", {}).get(hiband_scale_name)
+                if hiband_scale_name else None
+            )
+            if hiband_tensor is not None:
+                mm_module.hiband_act_scale = hiband_tensor
+            elif hasattr(mm_module, "hiband_act_scale"):
+                mm_module.hiband_act_scale = None
+
         if grouped_bias_tensor is None:
             return mm_module.apply(input_tensor)
 
@@ -269,6 +318,33 @@ class WanTransformerInfer(BaseTransformerInfer):
         q_group_bias = None
         k_group_bias = None
         v_group_bias = None
+        if self.hiband_runtime_enabled:
+            self._hiband_tensor_context = {
+                "self_attn_q": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "self_attn_q_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "self_attn_q_hiband_group_act_scales"),
+                    group_idx if use_htg_norm1 else None,
+                ),
+                "self_attn_k": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "self_attn_k_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "self_attn_k_hiband_group_act_scales"),
+                    group_idx if use_htg_norm1 else None,
+                ),
+                "self_attn_v": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "self_attn_v_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "self_attn_v_hiband_group_act_scales"),
+                    group_idx if use_htg_norm1 else None,
+                ),
+                "self_attn_o": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "self_attn_o_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "self_attn_o_hiband_group_act_scales"),
+                    group_idx if use_htg_norm1 else None,
+                ),
+            }
+            phase.self_attn_q._hiband_scale_name = "self_attn_q"
+            phase.self_attn_k._hiband_scale_name = "self_attn_k"
+            phase.self_attn_v._hiband_scale_name = "self_attn_v"
+            phase.self_attn_o._hiband_scale_name = "self_attn_o"
         if use_htg_norm1:
             if hasattr(phase, "self_attn_q_htg_group_bias"):
                 q_group_bias = phase.self_attn_q_htg_group_bias.tensor
@@ -276,6 +352,7 @@ class WanTransformerInfer(BaseTransformerInfer):
                 k_group_bias = phase.self_attn_k_htg_group_bias.tensor
             if hasattr(phase, "self_attn_v_htg_group_bias"):
                 v_group_bias = phase.self_attn_v_htg_group_bias.tensor
+        self._current_htg_group_idx = group_idx if use_htg_norm1 else 0
 
         q_proj = self._mm_apply_with_group_bias(
             phase.self_attn_q,
@@ -344,7 +421,28 @@ class WanTransformerInfer(BaseTransformerInfer):
                 **attn_running_args,
             )
 
-        y = phase.self_attn_o.apply(attn_out)
+        self_attn_o_htg_input_shift = self._get_phase_tensor(phase, "self_attn_o_htg_input_shift")
+        self_attn_o_htg_input_scale = self._get_phase_tensor(phase, "self_attn_o_htg_input_scale")
+        if self_attn_o_htg_input_shift is not None and self_attn_o_htg_input_scale is not None:
+            self_attn_o_boundaries = self._get_phase_tensor(phase, "self_attn_o_htg_group_boundaries")
+            self_attn_o_group_idx = self._get_htg_group_idx(self_attn_o_boundaries)
+            o_shift = self._select_group_tensor(self_attn_o_htg_input_shift, self_attn_o_group_idx)
+            o_scale = self_attn_o_htg_input_scale
+            attn_out = (attn_out - o_shift.to(attn_out.device, attn_out.dtype)) / o_scale.to(attn_out.device, attn_out.dtype)
+            self_attn_o_group_bias = self._get_phase_tensor(phase, "self_attn_o_htg_group_bias")
+            y = self._mm_apply_with_group_bias(
+                phase.self_attn_o,
+                attn_out,
+                self_attn_o_group_bias,
+                self_attn_o_group_idx,
+            )
+        else:
+            y = self._mm_apply_with_group_bias(
+                phase.self_attn_o,
+                attn_out,
+                None,
+                group_idx if use_htg_norm1 else 0,
+            )
 
         if self.clean_cuda_cache:
             del q, k, v, attn_out
@@ -358,7 +456,48 @@ class WanTransformerInfer(BaseTransformerInfer):
         else:
             x.add_(y_out * gate_msa.squeeze())
 
-        norm3_out = phase.norm3.apply(x)
+        cross_attn_boundaries = self._get_phase_tensor(phase, "cross_attn_htg_boundaries")
+        if cross_attn_boundaries is not None:
+            group_idx = self._get_htg_group_idx(cross_attn_boundaries)
+        else:
+            group_idx = self._current_htg_group_idx
+
+        use_htg_cross_norm = (
+            hasattr(phase, "cross_attn_htg_norm_weight")
+            and hasattr(phase, "cross_attn_htg_norm_bias")
+            and phase.cross_attn_htg_norm_weight.tensor is not None
+            and phase.cross_attn_htg_norm_bias.tensor is not None
+        )
+        if use_htg_cross_norm:
+            htg_weight = self._select_group_tensor(
+                phase.cross_attn_htg_norm_weight.tensor, group_idx
+            )
+            htg_bias = self._select_group_tensor(
+                phase.cross_attn_htg_norm_bias.tensor, group_idx
+            )
+            original_weight_diff = getattr(phase.norm3, "weight_diff", None)
+            original_bias_diff = getattr(phase.norm3, "bias_diff", None)
+            had_weight_diff = hasattr(phase.norm3, "weight_diff")
+            had_bias_diff = hasattr(phase.norm3, "bias_diff")
+            phase.norm3.weight_diff = htg_weight - phase.norm3.weight
+            if phase.norm3.bias is None:
+                phase.norm3.bias_diff = htg_bias
+            else:
+                phase.norm3.bias_diff = htg_bias - phase.norm3.bias
+            try:
+                norm3_out = phase.norm3.apply(x)
+            finally:
+                if had_weight_diff:
+                    phase.norm3.weight_diff = original_weight_diff
+                else:
+                    delattr(phase.norm3, "weight_diff")
+                if had_bias_diff:
+                    phase.norm3.bias_diff = original_bias_diff
+                elif hasattr(phase.norm3, "bias_diff"):
+                    delattr(phase.norm3, "bias_diff")
+        else:
+            norm3_out = phase.norm3.apply(x)
+
         if self.task in ["i2v", "flf2v", "animate", "s2v", "rs2v"] and self.config.get("use_image_encoder", True):
             context_img = context[:257]
             context = context[257:]
@@ -371,9 +510,63 @@ class WanTransformerInfer(BaseTransformerInfer):
                 context_img = context_img.to(self.infer_dtype)
 
         n, d = self.num_heads, self.head_dim
-        q = phase.cross_attn_norm_q.apply(phase.cross_attn_q.apply(norm3_out)).view(-1, n, d)
-        k = phase.cross_attn_norm_k.apply(phase.cross_attn_k.apply(context)).view(-1, n, d)
-        v = phase.cross_attn_v.apply(context).view(-1, n, d)
+        q_group_bias = None
+        if self.hiband_runtime_enabled:
+            self._hiband_tensor_context = {
+                "cross_attn_q": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_q_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_q_hiband_group_act_scales"),
+                    group_idx,
+                ),
+                "cross_attn_k": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_k_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_k_hiband_group_act_scales"),
+                    group_idx,
+                ),
+                "cross_attn_v": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_v_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_v_hiband_group_act_scales"),
+                    group_idx,
+                ),
+                "cross_attn_o": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_o_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_o_hiband_group_act_scales"),
+                    group_idx,
+                ),
+                "cross_attn_k_img": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_k_img_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_k_img_hiband_group_act_scales"),
+                    group_idx,
+                ),
+                "cross_attn_v_img": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_v_img_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_v_img_hiband_group_act_scales"),
+                    group_idx,
+                ),
+            }
+            phase.cross_attn_q._hiband_scale_name = "cross_attn_q"
+            phase.cross_attn_k._hiband_scale_name = "cross_attn_k"
+            phase.cross_attn_v._hiband_scale_name = "cross_attn_v"
+            phase.cross_attn_o._hiband_scale_name = "cross_attn_o"
+            if hasattr(phase, "cross_attn_k_img"):
+                phase.cross_attn_k_img._hiband_scale_name = "cross_attn_k_img"
+            if hasattr(phase, "cross_attn_v_img"):
+                phase.cross_attn_v_img._hiband_scale_name = "cross_attn_v_img"
+
+        if use_htg_cross_norm and hasattr(phase, "cross_attn_q_htg_group_bias"):
+            q_group_bias = phase.cross_attn_q_htg_group_bias.tensor
+
+        q_proj = self._mm_apply_with_group_bias(
+            phase.cross_attn_q,
+            norm3_out,
+            q_group_bias,
+            group_idx,
+        )
+        k_proj = self._mm_apply_with_group_bias(phase.cross_attn_k, context, None, 0)
+        v_proj = self._mm_apply_with_group_bias(phase.cross_attn_v, context, None, 0)
+        q = phase.cross_attn_norm_q.apply(q_proj).view(-1, n, d)
+        k = phase.cross_attn_norm_k.apply(k_proj).view(-1, n, d)
+        v = v_proj.view(-1, n, d)
 
         if self.cross_attn_cu_seqlens_q is None:
             if self.cross_attn_1_type == "flash_attn2" or self.cross_attn_1_type == "flash_attn3":
@@ -396,8 +589,10 @@ class WanTransformerInfer(BaseTransformerInfer):
         )
 
         if self.task in ["i2v", "flf2v", "animate", "s2v", "rs2v"] and self.config.get("use_image_encoder", True) and context_img is not None:
-            k_img = phase.cross_attn_norm_k_img.apply(phase.cross_attn_k_img.apply(context_img)).view(-1, n, d)
-            v_img = phase.cross_attn_v_img.apply(context_img).view(-1, n, d)
+            k_img_proj = self._mm_apply_with_group_bias(phase.cross_attn_k_img, context_img, None, 0)
+            v_img_proj = self._mm_apply_with_group_bias(phase.cross_attn_v_img, context_img, None, 0)
+            k_img = phase.cross_attn_norm_k_img.apply(k_img_proj).view(-1, n, d)
+            v_img = v_img_proj.view(-1, n, d)
 
             if self.cross_attn_cu_seqlens_kv_img is None:
                 if self.cross_attn_2_type == "flash_attn2" or self.cross_attn_2_type == "flash_attn3":
@@ -420,7 +615,18 @@ class WanTransformerInfer(BaseTransformerInfer):
                 del k_img, v_img, img_attn_out
                 torch_device_module.empty_cache()
 
-        attn_out = phase.cross_attn_o.apply(attn_out)
+        cross_attn_o_htg_input_shift = self._get_phase_tensor(phase, "cross_attn_o_htg_input_shift")
+        cross_attn_o_htg_input_scale = self._get_phase_tensor(phase, "cross_attn_o_htg_input_scale")
+        if cross_attn_o_htg_input_shift is not None and cross_attn_o_htg_input_scale is not None:
+            cross_attn_o_boundaries = self._get_phase_tensor(phase, "cross_attn_o_htg_group_boundaries")
+            cross_attn_o_group_idx = self._get_htg_group_idx(cross_attn_o_boundaries)
+            o_shift = self._select_group_tensor(cross_attn_o_htg_input_shift, cross_attn_o_group_idx)
+            o_scale = cross_attn_o_htg_input_scale
+            attn_out = (attn_out - o_shift.to(attn_out.device, attn_out.dtype)) / o_scale.to(attn_out.device, attn_out.dtype)
+            cross_attn_o_group_bias = self._get_phase_tensor(phase, "cross_attn_o_htg_group_bias")
+            attn_out = self._mm_apply_with_group_bias(phase.cross_attn_o, attn_out, cross_attn_o_group_bias, cross_attn_o_group_idx)
+        else:
+            attn_out = self._mm_apply_with_group_bias(phase.cross_attn_o, attn_out, None, 0)
 
         if self.clean_cuda_cache:
             del q, k, v, norm3_out, context, context_img
@@ -472,6 +678,21 @@ class WanTransformerInfer(BaseTransformerInfer):
             norm2_out = norm2_out.to(self.infer_dtype)
 
         ffn0_group_bias = None
+        if self.hiband_runtime_enabled:
+            self._hiband_tensor_context = {
+                "ffn_0": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "ffn_0_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "ffn_0_hiband_group_act_scales"),
+                    group_idx if use_htg_norm2 else None,
+                ),
+                "ffn_2": self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "ffn_2_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "ffn_2_hiband_group_act_scales"),
+                    group_idx if use_htg_norm2 else None,
+                ),
+            }
+            phase.ffn_0._hiband_scale_name = "ffn_0"
+            phase.ffn_2._hiband_scale_name = "ffn_2"
         if use_htg_norm2 and hasattr(phase, "ffn_0_htg_group_bias"):
             ffn0_group_bias = phase.ffn_0_htg_group_bias.tensor
         y = self._mm_apply_with_group_bias(
@@ -486,7 +707,12 @@ class WanTransformerInfer(BaseTransformerInfer):
         y = torch.nn.functional.gelu(y, approximate="tanh")
         if self.clean_cuda_cache:
             torch_device_module.empty_cache()
-        y = phase.ffn_2.apply(y)
+        y = self._mm_apply_with_group_bias(
+            phase.ffn_2,
+            y,
+            None,
+            group_idx if use_htg_norm2 else 0,
+        )
 
         return y
 

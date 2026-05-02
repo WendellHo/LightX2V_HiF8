@@ -223,6 +223,12 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         self.transformer_weights.load(self.original_weight_dict)
         if hasattr(self, "post_weight"):
             self.post_weight.load(self.original_weight_dict)
+        if hasattr(self.pre_weight, "set_config"):
+            self.pre_weight.set_config(self.config)
+        if hasattr(self.transformer_weights, "set_config"):
+            self.transformer_weights.set_config(self.config)
+        if hasattr(self, "post_weight") and hasattr(self.post_weight, "set_config"):
+            self.post_weight.set_config(self.config)
 
         # Handle LoRA if needed
         if self.config.get("lora_dynamic_apply", False):
