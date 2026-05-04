@@ -426,6 +426,12 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self_attn_o_htg_input_shift is not None and self_attn_o_htg_input_scale is not None:
             self_attn_o_boundaries = self._get_phase_tensor(phase, "self_attn_o_htg_group_boundaries")
             self_attn_o_group_idx = self._get_htg_group_idx(self_attn_o_boundaries)
+            if self.hiband_runtime_enabled:
+                self._hiband_tensor_context["self_attn_o"] = self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "self_attn_o_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "self_attn_o_hiband_group_act_scales"),
+                    self_attn_o_group_idx,
+                )
             o_shift = self._select_group_tensor(self_attn_o_htg_input_shift, self_attn_o_group_idx)
             o_scale = self_attn_o_htg_input_scale
             attn_out = (attn_out - o_shift.to(attn_out.device, attn_out.dtype)) / o_scale.to(attn_out.device, attn_out.dtype)
@@ -620,6 +626,12 @@ class WanTransformerInfer(BaseTransformerInfer):
         if cross_attn_o_htg_input_shift is not None and cross_attn_o_htg_input_scale is not None:
             cross_attn_o_boundaries = self._get_phase_tensor(phase, "cross_attn_o_htg_group_boundaries")
             cross_attn_o_group_idx = self._get_htg_group_idx(cross_attn_o_boundaries)
+            if self.hiband_runtime_enabled:
+                self._hiband_tensor_context["cross_attn_o"] = self._resolve_hiband_tensor(
+                    self._get_phase_tensor(phase, "cross_attn_o_hiband_act_scale"),
+                    self._get_phase_tensor(phase, "cross_attn_o_hiband_group_act_scales"),
+                    cross_attn_o_group_idx,
+                )
             o_shift = self._select_group_tensor(cross_attn_o_htg_input_shift, cross_attn_o_group_idx)
             o_scale = cross_attn_o_htg_input_scale
             attn_out = (attn_out - o_shift.to(attn_out.device, attn_out.dtype)) / o_scale.to(attn_out.device, attn_out.dtype)

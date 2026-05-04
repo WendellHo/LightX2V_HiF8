@@ -119,6 +119,7 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             "hif8-cuda",
             "hif8-fused",
             "hif8-fused-kernel",
+            "hif8-fake-bf16",
         ]
 
     @abstractmethod

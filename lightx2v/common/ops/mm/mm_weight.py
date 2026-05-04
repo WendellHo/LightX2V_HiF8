@@ -1099,6 +1099,47 @@ class MMWeightWhif8channelAhif8dynamicFusedKernel(MMWeightWhif8channelAhif8dynam
             return super().apply(input_tensor)
 
 
+@MM_WEIGHT_REGISTER("hif8-fake-bf16")
+class MMWeightWhif8FakeBf16Ahif8dynamic(MMWeightWhif8channelAhif8dynamicFallback):
+    """
+    hif8-fake-bf16:
+      - store weights as bf16 tensors already rounded to HiF8 representable levels
+      - reuse existing HiF8 input-side QDQ / HiBand runtime path
+      - skip native uint8 decode entirely during inference
+    """
+
+    def __init__(
+        self,
+        weight_name,
+        bias_name,
+        create_cuda_buffer=False,
+        create_cpu_buffer=False,
+        lazy_load=False,
+        lazy_load_file=None,
+        is_post_adapter=False,
+        lora_prefix="diffusion_model.blocks",
+        lora_path="",
+    ):
+        super().__init__(
+            weight_name,
+            bias_name,
+            create_cuda_buffer,
+            create_cpu_buffer,
+            lazy_load,
+            lazy_load_file,
+            is_post_adapter,
+            lora_prefix,
+            lora_path,
+        )
+
+    def _unpack_hif8_weight(self, dtype):
+        if self.weight.dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+            raise RuntimeError(
+                "hif8-fake-bf16 expects fake-quant floating weight container, "
+                f"but got {self.weight.dtype}."
+            )
+        return self.weight.to(dtype)
+
 @MM_WEIGHT_REGISTER("mxfp4")
 class MMWeightWmxfp4Amxfp4dynamic(MMWeightQuantTemplate):
     """
